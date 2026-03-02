@@ -1,6 +1,6 @@
 // treecat.rs.d/src/render.rs
 
-use crate::classify::{looks_like_text, SAMPLE_BYTES};
+use crate::classify::{SAMPLE_BYTES, looks_like_text};
 use anyhow::{Context, Result};
 use infer::Infer;
 use std::fs;
@@ -11,7 +11,9 @@ pub fn write_one(infer: &Infer, path: &Path, mut w: impl Write) -> Result<()> {
     writeln!(w, "{}:", path.display()).context("write header")?;
 
     let mut f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let meta = f.metadata().with_context(|| format!("stat {}", path.display()))?;
+    let meta = f
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
     let size = meta.len();
 
     let mut sample = vec![0u8; SAMPLE_BYTES.min(size as usize)];
@@ -29,7 +31,9 @@ pub fn write_one(infer: &Infer, path: &Path, mut w: impl Write) -> Result<()> {
         let mut last_byte: Option<u8> = None;
 
         loop {
-            let n = r.read(&mut buf).with_context(|| format!("read {}", path.display()))?;
+            let n = r
+                .read(&mut buf)
+                .with_context(|| format!("read {}", path.display()))?;
             if n == 0 {
                 break;
             }

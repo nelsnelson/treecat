@@ -1,0 +1,185 @@
+stages: [build, upload, release]
+
+workflow:
+  rules:
+    - when: always
+
+default:
+  interruptible: true
+
+variables:
+  # Adjust these:
+  BIN_NAME: "your_binary_name"
+  PACKAGE_NAME: "release-binaries"
+
+  # Cargo caching locations (safe to cache across jobs)
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target"
+
+# ------------------------
+# Build: macOS (arm64 + x86_64 + universal)
+# Requires a macOS runner tagged "macos"
+# ------------------------
+build:macos:
+  stage: build
+  tags: [macos]
+  rules:
+    - if: $CI_COMMIT_TAG
+  cache:
+    key:
+      files: [Cargo.lock]
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+    policy: pull-push
+  script:
+    - set -euo pipefail
+    - rustc -V
+    - cargo -V
+
+    - rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+    - cargo build --release --locked --target aarch64-apple-darwin
+    - cargo build --release --locked --target x86_64-apple-darwin
+
+    - mkdir -p dist/macos/{aarch64,x86_64,universal}
+
+    - cp "target/aarch64-apple-darwin/release/${BIN_NAME}" "dist/macos/aarch64/${BIN_NAME}"
+    - cp "target/x86_64-apple-darwin/release/${BIN_NAME}" "dist/macos/x86_64/${BIN_NAME}"
+
+    # Optional universal binary
+    - lipo -create \
+        "dist/macos/aarch64/${BIN_NAME}" \
+        "dist/macos/x86_64/${BIN_NAME}" \
+      -output "dist/macos/universal/${BIN_NAME}"
+
+  artifacts:
+    paths:
+      - dist/macos/
+    expire_in: 1 week
+
+# ------------------------
+# Build: Linux (x86_64 + arm64)
+# Uses cross (Docker-in-Docker) to make aarch64 reliable.
+# ------------------------
+build:linux:
+  stage: build
+  image: rust:latest
+  services:
+    - name: docker:dind
+      command: ["--tls=false"]
+  rules:
+    - if: $CI_COMMIT_TAG
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  cache:
+    key:
+      files: [Cargo.lock]
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+    policy: pull-push
+  parallel:
+    matrix:
+      - TARGET: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+  script:
+    - set -euo pipefail
+    - rustc -V
+    - cargo -V
+
+    - cargo install cross --locked
+    - cross build --release --locked --target "${TARGET}"
+
+    - mkdir -p "dist/linux/${TARGET}"
+    - cp "target/${TARGET}/release/${BIN_NAME}" "dist/linux/${TARGET}/${BIN_NAME}"
+  artifacts:
+    paths:
+      - dist/linux/
+    expire_in: 1 week
+
+# ------------------------
+# Upload: push all built binaries to Generic Package Registry
+# Uses CI_JOB_TOKEN header auth and the documented endpoint format.
+# ------------------------
+upload:packages:
+  stage: upload
+  image: curlimages/curl:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  needs:
+    # Only download the artifacts we need (faster / less bandwidth).
+    - job: build:macos
+      artifacts: true
+    - job: build:linux
+      artifacts: true
+  script:
+    - set -euo pipefail
+
+    # Generic packages upload endpoint (version is the tag)
+    # PUT /projects/:id/packages/generic/:package_name/:package_version/:file_name
+    # Docs show using CI_COMMIT_TAG as the package_version and CI_JOB_TOKEN auth. :contentReference[oaicite:2]{index=2}
+    - export PACKAGE_VERSION="${CI_COMMIT_TAG}"
+    - export PACKAGE_REGISTRY_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${PACKAGE_VERSION}"
+
+    - mkdir -p dist_upload
+    - |
+      # Normalize file names so Release assets are clear
+      # Example: mybin-macos-arm64, mybin-linux-x86_64, etc.
+      cp "dist/macos/aarch64/${BIN_NAME}" "dist_upload/${BIN_NAME}-macos-arm64"
+      cp "dist/macos/x86_64/${BIN_NAME}" "dist_upload/${BIN_NAME}-macos-x86_64"
+      cp "dist/macos/universal/${BIN_NAME}" "dist_upload/${BIN_NAME}-macos-universal"
+
+      cp "dist/linux/x86_64-unknown-linux-gnu/${BIN_NAME}" "dist_upload/${BIN_NAME}-linux-x86_64"
+      cp "dist/linux/aarch64-unknown-linux-gnu/${BIN_NAME}" "dist_upload/${BIN_NAME}-linux-arm64"
+
+    - |
+      for file in dist_upload/*; do
+        name="$(basename "$file")"
+        curl --location --fail \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "$file" \
+          "${PACKAGE_REGISTRY_URL}/${name}"
+        echo "Uploaded: ${name}"
+      done
+
+  artifacts:
+    paths:
+      - dist_upload/
+    expire_in: 1 week
+
+# ------------------------
+# Release: create GitLab Release and attach asset links to package URLs
+# Uses glab (GitLab CLI) as shown in GitLab Releases docs. :contentReference[oaicite:3]{index=3}
+# ------------------------
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  needs:
+    - job: upload:packages
+      artifacts: true
+  script:
+    - set -euo pipefail
+    - export PACKAGE_VERSION="${CI_COMMIT_TAG}"
+    - export PACKAGE_REGISTRY_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${PACKAGE_VERSION}"
+
+    - |
+      ASSETS_JSON=$(
+        cat <<EOF
+[
+  {"name":"${BIN_NAME}-macos-arm64","url":"${PACKAGE_REGISTRY_URL}/${BIN_NAME}-macos-arm64","link_type":"package"},
+  {"name":"${BIN_NAME}-macos-x86_64","url":"${PACKAGE_REGISTRY_URL}/${BIN_NAME}-macos-x86_64","link_type":"package"},
+  {"name":"${BIN_NAME}-macos-universal","url":"${PACKAGE_REGISTRY_URL}/${BIN_NAME}-macos-universal","link_type":"package"},
+  {"name":"${BIN_NAME}-linux-x86_64","url":"${PACKAGE_REGISTRY_URL}/${BIN_NAME}-linux-x86_64","link_type":"package"},
+  {"name":"${BIN_NAME}-linux-arm64","url":"${PACKAGE_REGISTRY_URL}/${BIN_NAME}-linux-arm64","link_type":"package"}
+]
+EOF
+      )
+
+      glab release create "${CI_COMMIT_TAG}" \
+        --name "Release ${CI_COMMIT_TAG}" \
+        --notes "Automated release for ${CI_COMMIT_TAG}" \
+        --assets-links "${ASSETS_JSON}"

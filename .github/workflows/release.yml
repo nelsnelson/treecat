@@ -1,0 +1,118 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "release-v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vers.outputs.version }}
+      tag: ${{ steps.vers.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: vers
+        name: Derive version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          version="${tag#release-v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check Cargo.toml version matches tag version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.vers.outputs.version }}"
+          grep -q "version = \"$version\"" Cargo.toml
+
+      - name: Create GitHub release (draft)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.vers.outputs.tag }}" \
+            --draft \
+            --verify-tag \
+            --title "${{ steps.vers.outputs.tag }}"
+
+  build-release:
+    needs: [create-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            use_cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSRV) + target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+          target: ${{ matrix.target }}
+
+      - name: Install cross (Linux aarch64 only)
+        if: matrix.use_cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cross build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.create-release.outputs.version }}"
+          target="${{ matrix.target }}"
+          name="treecat-${version}-${target}"
+          bin="target/${target}/release/treecat"
+
+          mkdir -p "${name}"
+          cp "${bin}" "${name}/"
+          cp README.md LICENSE "${name}/"
+
+          tar czf "${name}.tar.gz" "${name}"
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+          echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+          echo "ASSET_SUM=${name}.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload assets to release draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.create-release.outputs.tag }}" \
+            "${{ env.ASSET }}" \
+            "${{ env.ASSET_SUM }}"

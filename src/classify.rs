@@ -7,7 +7,7 @@ pub fn looks_like_text(sample: &[u8]) -> bool {
         return true;
     }
 
-    if sample.iter().any(|&b| b == 0) {
+    if sample.contains(&0) {
         return false;
     }
 
@@ -17,7 +17,7 @@ pub fn looks_like_text(sample: &[u8]) -> bool {
 
     let mut good = 0usize;
     for &b in sample {
-        let ok = matches!(b, b'\n' | b'\r' | b'\t') || (b >= 0x20 && b <= 0x7E);
+        let ok = matches!(b, b'\n' | b'\r' | b'\t') || (0x20..=0x7E).contains(&b);
         if ok {
             good += 1;
         }
