@@ -9,5 +9,6 @@ pub fn is_noise_excluded(path: &Path) -> bool {
 }
 
 pub fn contains_dot_git(path: &Path) -> bool {
-    path.components().any(|c| c.as_os_str() == OsStr::new(".git"))
+    path.components()
+        .any(|c| c.as_os_str() == OsStr::new(".git"))
 }
